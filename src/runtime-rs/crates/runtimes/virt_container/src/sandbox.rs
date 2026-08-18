@@ -435,10 +435,16 @@ impl VirtSandbox {
             info!(sl!(), "pod cdi devices: {:?}", cdi_devices);
 
             let device_nodes = handle_cdi_devices(&cdi_devices).await?;
+            // A CDI device is free to mix VFIO nodes with nodes that only ever
+            // exist inside the guest: an IB VF spec pairs /dev/vfio/devices/vfioN
+            // with a fully-specified /dev/infiniband/uverbsN that kata-agent
+            // creates in the guest from the container spec. Only the VFIO nodes
+            // name something on the host that can be handed to the VMM.
             paths.extend(
                 device_nodes
                     .iter()
-                    .filter_map(pod_resources_rs::device_node_host_path),
+                    .filter_map(pod_resources_rs::device_node_host_path)
+                    .filter(|path| is_vfio_device_path(path)),
             );
         }
 
@@ -984,10 +990,15 @@ impl VirtSandbox {
     }
 }
 
+/// Whether a device node path is a VFIO pass-through device. The legacy
+/// `/dev/vfio/vfio` control node is not one.
+fn is_vfio_device_path(path: &str) -> bool {
+    path.starts_with("/dev/vfio") && path != "/dev/vfio/vfio"
+}
+
 /// Collect VFIO character device nodes (e.g. /dev/vfio/devices/vfio0) that a CDI
 /// runtime injected directly into the OCI spec for the Docker/nerdctl/podman
-/// flow, where there is no kubelet PodResources API to query. The legacy
-/// `/dev/vfio/vfio` control node is skipped as it is not a pass-through device.
+/// flow, where there is no kubelet PodResources API to query.
 fn oci_spec_vfio_device_paths() -> Vec<String> {
     let Ok(spec) = load_oci_spec() else {
         return Vec::new();
@@ -1003,7 +1014,7 @@ fn oci_spec_vfio_device_paths() -> Vec<String> {
         .iter()
         .filter(|dev| dev.typ() == oci::LinuxDeviceType::C)
         .map(|dev| dev.path().display().to_string())
-        .filter(|path| path.starts_with("/dev/vfio") && path != "/dev/vfio/vfio")
+        .filter(|path| is_vfio_device_path(path))
         .collect()
 }
 
