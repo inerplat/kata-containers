@@ -35,7 +35,15 @@ lazy_static! {
         m.insert("0x10de-0x030", "nvidia.com/gpu");
         m.insert("0x8086-0x030", "intel.com/gpu");
         m.insert("0x1002-0x030", "amd.com/gpu");
-        m.insert("0x15b3-0x020", "nvidia.com/nic");
+        // A kind belongs here only once something inside the guest publishes a
+        // CDI spec for it. The annotation this table produces is resolved by
+        // the agent against the guest's own spec directory, so naming a kind
+        // no in-guest generator emits costs the container its whole CDI
+        // timeout and then fails it. Mellanox NICs used to map to
+        // "nvidia.com/nic": nothing generates that kind (the NVIDIA toolkit's
+        // Mellanox mode emits "nvidia.com/mofed" with a single "all" device),
+        // and their device nodes already reach the container through the
+        // container spec, so they are left unmapped.
         // TODO:  it will be updated as required.
         m
     };
