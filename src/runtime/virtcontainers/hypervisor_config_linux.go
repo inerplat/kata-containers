@@ -36,7 +36,7 @@ func validateHypervisorConfig(conf *HypervisorConfig) error {
 		return err
 	}
 
-	if !validHugePagesUsedBy(conf.HugePagesUsedBy) {
+	if conf.HugePagesPodSizing && !validHugePagesUsedBy(conf.HugePagesUsedBy) {
 		return fmt.Errorf("hugepages_used_by %q is not %s or %s", conf.HugePagesUsedBy, HugePagesUsedByHost, HugePagesUsedByGuest)
 	}
 

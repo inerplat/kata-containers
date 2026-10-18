@@ -1856,6 +1856,7 @@ func (c *Container) update(ctx context.Context, resources specs.LinuxResources) 
 	if c.config.Resources.CPU == nil {
 		c.config.Resources.CPU = &specs.LinuxCPU{}
 	}
+	heldCPU := *c.config.Resources.CPU
 
 	if cpu := resources.CPU; cpu != nil {
 		if p := cpu.Period; p != nil && *p != 0 {
@@ -1875,6 +1876,8 @@ func (c *Container) update(ctx context.Context, resources specs.LinuxResources) 
 	if c.config.Resources.Memory == nil {
 		c.config.Resources.Memory = &specs.LinuxMemory{}
 	}
+	heldMemory := *c.config.Resources.Memory
+	heldHugepages := append([]specs.LinuxHugepageLimit(nil), c.config.Resources.HugepageLimits...)
 
 	if mem := resources.Memory; mem != nil && mem.Limit != nil {
 		c.config.Resources.Memory.Limit = mem.Limit
@@ -1899,7 +1902,17 @@ func (c *Container) update(ctx context.Context, resources specs.LinuxResources) 
 		}
 	}
 
-	return c.sandbox.agent.updateContainer(ctx, c.sandbox, *c, resources)
+	if err := c.sandbox.agent.updateContainer(ctx, c.sandbox, *c, resources); err != nil {
+		// A refused update must not stay recorded for later checks.
+		var refusal guestCapacityRefusal
+		if errors.As(err, &refusal) {
+			*c.config.Resources.CPU = heldCPU
+			*c.config.Resources.Memory = heldMemory
+			c.config.Resources.HugepageLimits = heldHugepages
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *Container) pause(ctx context.Context) error {

@@ -1909,12 +1909,26 @@ func (s *Sandbox) addContainer(c *Container) error {
 	return nil
 }
 
+// Points each container of a pod sized guest at its entry in s.config.Containers,
+// which append and delete move.
+func (s *Sandbox) relinkContainerConfigs() {
+	if !hugePagePodSized(&s.config.HypervisorConfig) {
+		return
+	}
+	for i := range s.config.Containers {
+		if c, ok := s.containers[s.config.Containers[i].ID]; ok {
+			c.config = &s.config.Containers[i]
+		}
+	}
+}
+
 // CreateContainer creates a new container in the sandbox
 // This should be called only when the sandbox is already created.
 // It will add new container config to sandbox.config.Containers
 func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfig) (VCContainer, error) {
 	// Update sandbox config to include the new container's config
 	s.config.Containers = append(s.config.Containers, contConfig)
+	s.relinkContainerConfigs()
 
 	var err error
 
@@ -1923,6 +1937,7 @@ func (s *Sandbox) CreateContainer(ctx context.Context, contConfig ContainerConfi
 			if len(s.config.Containers) > 0 {
 				// delete container config
 				s.config.Containers = s.config.Containers[:len(s.config.Containers)-1]
+				s.relinkContainerConfigs()
 			}
 		}
 	}()
@@ -2068,12 +2083,17 @@ func (s *Sandbox) DeleteContainer(ctx context.Context, containerID string) (VCCo
 	}
 
 	// Update sandbox config
+	if hugePagePodSized(&s.config.HypervisorConfig) {
+		detached := *c.config
+		c.config = &detached
+	}
 	for idx, contConfig := range s.config.Containers {
 		if contConfig.ID == containerID {
 			s.config.Containers = append(s.config.Containers[:idx], s.config.Containers[idx+1:]...)
 			break
 		}
 	}
+	s.relinkContainerConfigs()
 
 	// update the sandbox resource controller
 	if err = s.resourceControllerUpdate(ctx); err != nil {

@@ -119,6 +119,162 @@ func (k *kataAgent) guestPoolTotal(pageSize string, pools uint64) uint64 {
 	return k.poolsHighWater[pageSize]
 }
 
+// The guest pool held for pageSize, kept after the containers that asked stop.
+func (k *kataAgent) guestPoolsHeld(pageSize string) uint64 {
+	k.poolsLock.Lock()
+	defer k.poolsLock.Unlock()
+	return k.poolsHighWater[pageSize]
+}
+
+func maxUint64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// A refusal for the guest's capacity, which leaves the container as it was.
+type guestCapacityRefusal struct{ error }
+
+func (e guestCapacityRefusal) Unwrap() error { return e.error }
+
+// The guest memory ceiling and guest huge pages a container was given.
+type appliedShare struct{ ceiling, pool uint64 }
+
+// Records what a container was given.
+func (k *kataAgent) recordApplied(id string, resources *grpc.LinuxResources, pool uint64) {
+	k.poolsLock.Lock()
+	defer k.poolsLock.Unlock()
+	if k.applied == nil {
+		k.applied = make(map[string]appliedShare)
+	}
+	share := appliedShare{pool: pool}
+	if resources != nil {
+		share.ceiling = uint64(memoryLimitBytes(resources.Memory))
+	}
+	k.applied[id] = share
+}
+
+func (k *kataAgent) appliedPool(id string) uint64 {
+	k.poolsLock.Lock()
+	defer k.poolsLock.Unlock()
+	return k.applied[id].pool
+}
+
+func (k *kataAgent) appliedCopy() map[string]appliedShare {
+	k.poolsLock.Lock()
+	defer k.poolsLock.Unlock()
+	out := make(map[string]appliedShare, len(k.applied))
+	for id, s := range k.applied {
+		out[id] = s
+	}
+	return out
+}
+
+// The running containers' guest huge pages, a running one counting with what it was given.
+func podPoolsBytes(reservations []podReservation, copied uint64, applied map[string]appliedShare, self string) uint64 {
+	var total uint64
+	for _, r := range reservations {
+		pool := ownPoolBytes(r, copied)
+		if a, ok := applied[r.id]; ok && r.id != self {
+			pool = a.pool
+		}
+		if pool > math.MaxUint64-total {
+			return math.MaxUint64
+		}
+		total += pool
+	}
+	return total
+}
+
+// A container's memory ceiling inside the guest, or zero when it has none.
+func guestCeilingBytes(r podReservation, copied uint64) uint64 {
+	if !r.pool {
+		if own, _ := ownHugePages(r.hugePages, copied, false); own != 0 {
+			return own
+		}
+	}
+	if r.memory > 0 && r.memory != math.MaxInt64 {
+		return uint64(r.memory)
+	}
+	return 0
+}
+
+// Refuses a container when the pod's ceilings, as given, and guest huge pages do not fit.
+func refusePodCeilingsPastGuest(reservations []podReservation, copied, running, held uint64, applied map[string]appliedShare, guest guestCapacity, self, name string) error {
+	guest.pools = 0
+	holdable := holdableGuestMemoryBytes(guest)
+	if holdable <= 0 {
+		return nil
+	}
+	pools := maxUint64(running, held)
+	var ceilings uint64
+	for _, r := range reservations {
+		c := guestCeilingBytes(r, copied)
+		if a, ok := applied[r.id]; ok && r.id != self {
+			c = a.ceiling
+		}
+		if c == 0 && pools != 0 && !r.sandbox {
+			return fmt.Errorf("container %s has no memory ceiling in a guest that keeps %d MiB of huge pages: give it a memory limit or huge pages of its own", r.name, pools>>utils.MibToBytesShift)
+		}
+		if c > math.MaxUint64-ceilings {
+			ceilings = math.MaxUint64
+			break
+		}
+		ceilings += c
+	}
+	need := ceilings
+	if pools > math.MaxUint64-need {
+		need = math.MaxUint64
+	} else {
+		need += pools
+	}
+	if need <= uint64(holdable) {
+		return nil
+	}
+	short := (need - uint64(holdable)) >> utils.MibToBytesShift
+	if short == 0 {
+		short = 1
+	}
+	stale := ""
+	if held > running {
+		stale = fmt.Sprintf(" (%d MiB of them still held for containers that stopped)", (held-running)>>utils.MibToBytesShift)
+	}
+	return fmt.Errorf("container %s brings the memory ceilings of the pod's containers to %d MiB beside %d MiB of guest huge pages%s, but the %d MiB guest holds %d MiB for them: the pod needs %d MiB more of the VM's huge pages, on the pod or as the runtime class's pod overhead",
+		name,
+		ceilings>>utils.MibToBytesShift,
+		pools>>utils.MibToBytesShift,
+		stale,
+		guest.memoryMB,
+		uint64(holdable)>>utils.MibToBytesShift,
+		short)
+}
+
+// Whether every container carries the same value past the VM, copy or not.
+func ambiguousCopiedReservation(reservations []podReservation, vmMemoryBytes uint64) (uint64, bool) {
+	if vmMemoryBytes == 0 {
+		return 0, false
+	}
+	var value, sum uint64
+	carriers := 0
+	for _, r := range reservations {
+		if r.hugePages == 0 {
+			continue
+		}
+		if value != 0 && r.hugePages != value {
+			return 0, false
+		}
+		value = r.hugePages
+		if r.hugePages > math.MaxUint64-sum {
+			sum = math.MaxUint64
+		} else {
+			sum += r.hugePages
+		}
+		carriers++
+	}
+	return value, carriers > 1 && sum > vmMemoryBytes && value <= vmMemoryBytes
+}
+
 // A hugetlbfs storage the agent mounts out of the container's sight, so that a
 // guest container gets its pool whether or not it mounts a huge page volume.
 func guestPoolStorage(containerID string, pageSizeBytes, total uint64) *grpc.Storage {

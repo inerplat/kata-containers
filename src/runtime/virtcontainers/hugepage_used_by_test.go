@@ -266,3 +266,204 @@ func TestFoldHeldHugePages(t *testing.T) {
 	foldHeldHugePages(resources, "1GB", 0)
 	assert.Empty(resources.HugepageLimits)
 }
+
+func TestGuestCeilingBytes(t *testing.T) {
+	const gib = uint64(1) << 30
+	assert := assert.New(t)
+
+	assert.Equal(16*gib, guestCeilingBytes(podReservation{hugePages: 16 * gib, memory: 1 << 20}, 0), "a host container is bounded by its pages")
+	assert.Equal(2*gib, guestCeilingBytes(podReservation{memory: int64(2 * gib)}, 0), "a container without pages is bounded by its memory limit")
+	assert.Equal(512*uint64(1<<20), guestCeilingBytes(podReservation{hugePages: 2 * gib, memory: 512 << 20, pool: true}, 0), "a guest container is bounded by its memory limit")
+	assert.Equal(256*uint64(1<<20), guestCeilingBytes(podReservation{hugePages: 16 * gib, memory: 256 << 20}, 16*gib), "a copy is not a ceiling")
+	assert.Equal(uint64(0), guestCeilingBytes(podReservation{}, 0), "no limit, no ceiling")
+}
+
+func TestRefusePodCeilingsPastGuest(t *testing.T) {
+	const gib = uint64(1) << 30
+	const mib = int64(1) << 20
+	assert := assert.New(t)
+
+	for _, tt := range []struct {
+		description  string
+		reservations []podReservation
+		copied       uint64
+		running      uint64
+		held         uint64
+		applied      map[string]appliedShare
+		guest        guestCapacity
+		refused      string
+	}{
+		{
+			description:  "every container declares its pages and the pod leaves room for the guest",
+			reservations: []podReservation{{name: "app", hugePages: 16 * gib, memory: mib}, {name: "logging", hugePages: 2 * gib, memory: mib}, {name: "metrics", hugePages: 2 * gib, memory: mib}},
+			guest:        guestCapacity{memoryMB: 22 * 1024, vCPUs: 6},
+		},
+		{
+			description:  "a sidecar's memory is not in the VM's size",
+			reservations: []podReservation{{name: "app", hugePages: 16 * gib, memory: 2048 * mib}, {name: "logging", memory: 2048 * mib}},
+			guest:        guestCapacity{memoryMB: 18 * 1024, vCPUs: 5},
+			refused:      "the pod needs",
+		},
+		{
+			description:  "a host container and a guest container's pages",
+			reservations: []podReservation{{name: "c1", hugePages: 14 * gib, memory: mib}, {name: "c2", hugePages: 2 * gib, memory: 512 * mib, pool: true}},
+			running:      2 * gib,
+			guest:        guestCapacity{memoryMB: 16 * 1024, vCPUs: 3},
+			refused:      "the pod needs",
+		},
+		{
+			description:  "the same pod with room in the overhead",
+			reservations: []podReservation{{name: "c1", hugePages: 14 * gib, memory: mib}, {name: "c2", hugePages: 2 * gib, memory: 512 * mib, pool: true}},
+			running:      2 * gib,
+			guest:        guestCapacity{memoryMB: 18 * 1024, vCPUs: 3},
+		},
+		{
+			description:  "pages the guest still holds from an init container",
+			reservations: []podReservation{{name: "main", hugePages: 8 * gib, memory: mib}},
+			held:         2 * gib,
+			guest:        guestCapacity{memoryMB: 10 * 1024, vCPUs: 3},
+			refused:      "still held for containers that stopped",
+		},
+		{
+			// a was created alone and given the pod level copy as its ceiling;
+			// once b arrives the values reveal the copy, but a keeps what it got.
+			description:  "a running container counts with the ceiling it was given",
+			reservations: []podReservation{{id: "a", name: "a", hugePages: 16 * gib, memory: 512 * mib}, {id: "self", name: "b", hugePages: 10 * gib, memory: mib}},
+			copied:       16 * gib,
+			applied:      map[string]appliedShare{"a": {ceiling: 16 * gib}},
+			guest:        guestCapacity{memoryMB: 24 * 1024, vCPUs: 3},
+			refused:      "the pod needs",
+		},
+		{
+			description:  "the container being checked counts with its new ceiling",
+			reservations: []podReservation{{id: "self", name: "app", hugePages: 4 * gib, memory: mib}},
+			applied:      map[string]appliedShare{"self": {ceiling: 64 * gib}},
+			guest:        guestCapacity{memoryMB: 6 * 1024, vCPUs: 2},
+		},
+		{
+			description:  "a guest of unknown size settles nothing",
+			reservations: []podReservation{{name: "app", hugePages: 64 * gib}},
+		},
+		{
+			description:  "a container without a ceiling beside guest huge pages",
+			reservations: []podReservation{{name: "pause", sandbox: true}, {name: "pool", hugePages: 4 * gib, memory: 256 * mib, pool: true}, {name: "hog"}},
+			running:      4 * gib,
+			guest:        guestCapacity{memoryMB: 8 * 1024, vCPUs: 2},
+			refused:      "container hog has no memory ceiling",
+		},
+		{
+			description:  "the sandbox container and an unbounded container without guest huge pages",
+			reservations: []podReservation{{name: "pause", sandbox: true}, {name: "app", hugePages: 4 * gib}, {name: "side"}},
+			guest:        guestCapacity{memoryMB: 6 * 1024, vCPUs: 2},
+		},
+		{
+			// A pod level 8Gi copied into b reads as b's own while the sum fits.
+			description:  "a copy the values cannot reveal is refused as a declaration",
+			reservations: []podReservation{{name: "a", hugePages: 1 * gib, memory: 512 * mib}, {name: "b", hugePages: 8 * gib, memory: 512 * mib}},
+			guest:        guestCapacity{memoryMB: 10 * 1024, vCPUs: 3},
+			refused:      "the pod needs 123 MiB more",
+		},
+	} {
+		err := refusePodCeilingsPastGuest(tt.reservations, tt.copied, tt.running, tt.held, tt.applied, tt.guest, "self", "x")
+		if tt.refused != "" {
+			assert.Error(err, tt.description)
+			assert.Contains(err.Error(), tt.refused, tt.description)
+			continue
+		}
+		assert.NoError(err, tt.description)
+	}
+}
+
+func TestGuestPoolsHeld(t *testing.T) {
+	const gib = uint64(1) << 30
+	assert := assert.New(t)
+	k := &kataAgent{}
+
+	assert.Equal(uint64(0), k.guestPoolsHeld("1GB"))
+	k.guestPoolTotal("1GB", 6*gib)
+	assert.Equal(6*gib, k.guestPoolsHeld("1GB"), "pages the guest still holds")
+	assert.Equal(6*gib, k.guestPoolsHeld("1GB"), "reading does not raise it")
+	assert.Equal(uint64(0), k.guestPoolsHeld("2MB"))
+}
+
+func TestRelinkContainerConfigs(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{config: &SandboxConfig{HypervisorConfig: HypervisorConfig{HugePages: true, HugePagesPodSizing: true}}, containers: map[string]*Container{}}
+	for _, id := range []string{"a", "b", "c"} {
+		s.config.Containers = append(s.config.Containers, ContainerConfig{ID: id})
+		s.relinkContainerConfigs()
+		s.containers[id] = &Container{id: id, config: &s.config.Containers[len(s.config.Containers)-1]}
+	}
+	s.config.Containers = append(s.config.Containers[:0], s.config.Containers[1:]...)
+	delete(s.containers, "a")
+	s.relinkContainerConfigs()
+	for _, id := range []string{"b", "c"} {
+		assert.Equal(id, s.containers[id].config.ID, "a delete shifts the entries after it")
+	}
+}
+
+func TestAmbiguousCopiedReservation(t *testing.T) {
+	const gib = uint64(1) << 30
+	assert := assert.New(t)
+
+	value, ambiguous := ambiguousCopiedReservation([]podReservation{{hugePages: 16 * gib}, {hugePages: 16 * gib}}, 18*gib)
+	assert.True(ambiguous, "the same value twice past the VM")
+	assert.Equal(16*gib, value)
+
+	_, ambiguous = ambiguousCopiedReservation([]podReservation{{hugePages: 10 * gib}, {hugePages: 16 * gib}, {hugePages: 16 * gib}}, 18*gib)
+	assert.False(ambiguous, "a smaller value tells the copies apart")
+	_, ambiguous = ambiguousCopiedReservation([]podReservation{{hugePages: 16 * gib}}, 18*gib)
+	assert.False(ambiguous, "a lone container")
+	_, ambiguous = ambiguousCopiedReservation([]podReservation{{hugePages: 8 * gib}, {hugePages: 8 * gib}, {}}, 18*gib)
+	assert.False(ambiguous, "values that fit the VM are declarations")
+	_, ambiguous = ambiguousCopiedReservation([]podReservation{{hugePages: 8 * gib}, {hugePages: 8 * gib}}, 0)
+	assert.False(ambiguous, "a guest of unknown size settles nothing")
+	_, ambiguous = ambiguousCopiedReservation([]podReservation{{hugePages: 4 * gib}, {hugePages: 4 * gib}}, 2*gib)
+	assert.False(ambiguous, "a VM smaller than the value was not sized from the pod")
+}
+
+func TestRecordApplied(t *testing.T) {
+	const gib = uint64(1) << 30
+	assert := assert.New(t)
+	k := &kataAgent{}
+	k.recordApplied("a", &pb.LinuxResources{Memory: &pb.LinuxMemory{Limit: int64(2 * gib)}}, 4*gib)
+	assert.Equal(appliedShare{ceiling: 2 * gib, pool: 4 * gib}, k.appliedCopy()["a"])
+	k.recordApplied("a", &pb.LinuxResources{Memory: &pb.LinuxMemory{Limit: int64(8 * gib)}}, k.appliedPool("a"))
+	assert.Equal(appliedShare{ceiling: 8 * gib, pool: 4 * gib}, k.appliedCopy()["a"], "an update keeps the pool")
+	k.recordApplied("u", nil, 0)
+	assert.Equal(appliedShare{}, k.appliedCopy()["u"], "no limit, no ceiling")
+}
+
+func TestPodPoolsBytesKeepsWhatRunningContainersGot(t *testing.T) {
+	const gib = uint64(1) << 30
+	assert := assert.New(t)
+	// a was given a 16Gi pool before b revealed its value as the pod level copy.
+	reservations := []podReservation{{id: "a", name: "a", hugePages: 16 * gib}, {id: "b", name: "b", hugePages: 10 * gib, pool: true}}
+	applied := map[string]appliedShare{"a": {ceiling: 512 << 20, pool: 16 * gib}}
+	assert.Equal(26*gib, podPoolsBytes(reservations, 16*gib, applied, "b"))
+	assert.Equal(10*gib, podPoolsBytes(reservations, 16*gib, nil, "b"))
+}
+
+func TestRelinkAfterRefusedDuplicate(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{config: &SandboxConfig{HypervisorConfig: HypervisorConfig{HugePages: true, HugePagesPodSizing: true}}, containers: map[string]*Container{}}
+	s.config.Containers = append(s.config.Containers, ContainerConfig{ID: "a", Annotations: map[string]string{"v": "kept"}})
+	s.containers["a"] = &Container{id: "a"}
+	s.relinkContainerConfigs()
+	// A second create with the same ID appends, relinks, then rolls back.
+	s.config.Containers = append(s.config.Containers, ContainerConfig{ID: "a", Annotations: map[string]string{"v": "refused"}})
+	s.relinkContainerConfigs()
+	s.config.Containers = s.config.Containers[:len(s.config.Containers)-1]
+	s.relinkContainerConfigs()
+	assert.Equal("kept", s.containers["a"].config.Annotations["v"])
+}
+
+func TestRelinkLeavesASandboxNotSizedFromThePod(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{config: &SandboxConfig{}, containers: map[string]*Container{}}
+	s.config.Containers = []ContainerConfig{{ID: "a"}}
+	held := &ContainerConfig{ID: "a"}
+	s.containers["a"] = &Container{id: "a", config: held}
+	s.relinkContainerConfigs()
+	assert.Same(held, s.containers["a"].config, "main behaviour is kept with the option off")
+}

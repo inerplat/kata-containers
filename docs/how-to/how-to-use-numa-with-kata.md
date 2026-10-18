@@ -368,8 +368,9 @@ EOF
     - a huge page backed `emptyDir` on a `host` container;
     - a container named `guest` that reserves none of the VM's page size of its own;
     - huge pages of another page size than the VM's;
-    - a ceiling that does not fit what the guest holds after the `guest`
-      containers' huge pages, with the amount the pod is short;
+    - ceilings and guest huge pages that together do not fit the guest, with
+      the amount the pod is short;
+    - containers that all carry the same pod level value past the VM's size;
     - a change of the annotation while the pod runs.
 
 !!! warning "`hugepages-<size>` has to cover `default_memory`"

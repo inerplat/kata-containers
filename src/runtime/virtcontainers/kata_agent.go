@@ -337,6 +337,8 @@ type kataAgent struct {
 	// for so far, by page size.
 	poolsLock      sync.Mutex
 	poolsHighWater map[string]uint64
+	// applied is what each container was given in the guest.
+	applied map[string]appliedShare
 }
 
 func (k *kataAgent) Logger() *logrus.Entry {
@@ -1133,12 +1135,15 @@ func hugePagesTotalOCI(limits []specs.LinuxHugepageLimit, pageSize string) uint6
 // What one container carries into the guest: the pages of the VM's size it is
 // down for, and the memory limit its ceiling adds to them.
 type podReservation struct {
+	id        string
 	name      string
 	hugePages uint64
 	memory    int64
 	// pool is set when the container's reservation buys it a huge page pool
 	// inside the guest rather than ordinary guest memory.
 	pool bool
+	// sandbox is set for the sandbox container, which runs nothing of the pod's.
+	sandbox bool
 }
 
 // What each of a sandbox's containers carries, and the pod allowance the
@@ -1153,8 +1158,10 @@ func podReservations(sandbox *Sandbox, pageSize string, vmMemoryBytes uint64) ([
 			continue
 		}
 		r := podReservation{
+			id:        cfg.ID,
 			name:      containerDisplayName(cfg),
 			hugePages: hugePagesTotalOCI(cfg.Resources.HugepageLimits, pageSize),
+			sandbox:   ContainerType(cfg.Annotations[vcAnnotations.ContainerTypeKey]).IsSandbox(),
 		}
 		if cfg.Resources.Memory != nil && cfg.Resources.Memory.Limit != nil {
 			r.memory = *cfg.Resources.Memory.Limit
@@ -1208,7 +1215,7 @@ func copiedReservation(reservations []podReservation, vmMemoryBytes uint64) uint
 			below = true
 		}
 	}
-	if sum <= vmMemoryBytes || !below {
+	if sum <= vmMemoryBytes || !below || largest > vmMemoryBytes {
 		return 0
 	}
 	return largest
@@ -1238,47 +1245,6 @@ func ownPoolBytes(r podReservation, copied uint64) uint64 {
 		return 0
 	}
 	return r.hugePages
-}
-
-// ownPoolsBytes is what the guest huge page pools of a sandbox's containers
-// take out of its memory together, saturating rather than wrapping.
-func ownPoolsBytes(reservations []podReservation, copied uint64) uint64 {
-	var total uint64
-	for _, r := range reservations {
-		pool := ownPoolBytes(r, copied)
-		if pool > math.MaxUint64-total {
-			return math.MaxUint64
-		}
-		total += pool
-	}
-	return total
-}
-
-// Refuses pools the guest cannot fit, since naming both sizes here beats the
-// agent reporting how many pages it got. The pools come out of the same guest
-// memory, so they are refused together. Ceilings are held, not refused.
-func refuseGuestHugePagePoolTooLarge(reservations []podReservation, copied uint64, guest guestCapacity) error {
-	guest.pools = 0
-	holdable := holdableGuestMemoryBytes(guest)
-	if holdable <= 0 {
-		return nil
-	}
-
-	var names []string
-	for _, r := range reservations {
-		if ownPoolBytes(r, copied) != 0 {
-			names = append(names, r.name)
-		}
-	}
-	pools := ownPoolsBytes(reservations, copied)
-	if pools == 0 || capToInt64(pools) < holdable {
-		return nil
-	}
-	return fmt.Errorf("containers %s ask for %d MiB of huge page pools inside a guest that holds %d MiB of the %d MiB it was given: reserve more huge pages for the pod, or ask for smaller pools",
-		strings.Join(names, ", "),
-		pools>>utils.MibToBytesShift,
-		uint64(holdable)>>utils.MibToBytesShift,
-		guest.memoryMB)
 }
 
 // Whether a container mounts a huge page backed emptyDir, the mount
@@ -2023,6 +1989,8 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 	usedBy := HugePagesUsedByHost
 	var copied, poolTotal, vmPageBytes uint64
 	var poolSizes map[int64]string
+	var poolPageSize string
+	var poolOwn uint64
 
 	if !podSized {
 		c.config.GuestHugePagePool = mountsPool
@@ -2036,6 +2004,10 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 		}
 		var reservations []podReservation
 		reservations, copied = podReservations(sandbox, pageSize, uint64(guest.memoryMB)<<utils.MibToBytesShift)
+		if value, ambiguous := ambiguousCopiedReservation(reservations, uint64(guest.memoryMB)<<utils.MibToBytesShift); ambiguous {
+			resource := resCtrl.HugepagesResourceName(vmPageBytes)
+			return nil, fmt.Errorf("the pod level %s is copied into every container that does not declare it, and each container of this pod carries %d MiB of it, so a copy cannot be told from a declaration: declare %s on every container of the pod", resource, value>>utils.MibToBytesShift, resource)
+		}
 		own, _ := ownHugePages(hugePagesTotalOCI(c.config.Resources.HugepageLimits, pageSize), copied, false)
 
 		if usedBy, err = containerHugePagesUsedBy(sandbox, c.config, own); err != nil {
@@ -2048,12 +2020,14 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 		if c.config.GuestHugePagePool && own == 0 {
 			return nil, fmt.Errorf("container %s keeps its huge pages for the guest but reserves no %s of its own: give it one in its resources", name, resCtrl.HugepagesResourceName(vmPageBytes))
 		}
-		if err := refuseGuestHugePagePoolTooLarge(reservations, copied, guest); err != nil {
+		applied := k.appliedCopy()
+		running, held := podPoolsBytes(reservations, copied, applied, c.id), k.guestPoolsHeld(pageSize)
+		guest.pools = maxUint64(running, held)
+		if err := refusePodCeilingsPastGuest(reservations, copied, running, held, applied, guest, c.id, name); err != nil {
 			return nil, err
 		}
-		guest.pools = ownPoolsBytes(reservations, copied)
 		if c.config.GuestHugePagePool {
-			poolTotal = k.guestPoolTotal(pageSize, guest.pools)
+			poolTotal, poolPageSize, poolOwn = guest.pools, pageSize, own
 			poolSizes = map[int64]string{int64(vmPageBytes): strconv.FormatUint(poolTotal, 10)}
 		}
 	}
@@ -2159,11 +2133,19 @@ func (k *kataAgent) createContainer(ctx context.Context, sandbox *Sandbox, c *Co
 		SandboxPidns: sharedPidNs,
 	}
 
-	if _, err = k.sendReq(ctx, req); err != nil {
+	_, err = k.sendReq(ctx, req)
+	// The agent does not give back the pages of a create that failed after its storages.
+	if poolTotal != 0 {
+		k.guestPoolTotal(poolPageSize, poolTotal)
+	}
+	if err != nil {
 		if err.Error() == context.DeadlineExceeded.Error() {
 			return nil, grpcStatus.Errorf(codes.DeadlineExceeded, "CreateContainerRequest timed out")
 		}
 		return nil, err
+	}
+	if podSized {
+		k.recordApplied(c.id, grpcSpec.Linux.Resources, poolOwn)
 	}
 
 	return buildProcessFromExecID(req.ExecId)
@@ -2717,7 +2699,12 @@ func (k *kataAgent) updateContainer(ctx context.Context, sandbox *Sandbox, c Con
 			return fmt.Errorf("cannot tell the VM's huge page size to update container %s: %w", c.id, err)
 		}
 		reservations, copied := podReservations(sandbox, pageSize, uint64(guest.memoryMB)<<utils.MibToBytesShift)
-		guest.pools = ownPoolsBytes(reservations, copied)
+		applied := k.appliedCopy()
+		running, poolsHeld := podPoolsBytes(reservations, copied, applied, ""), k.guestPoolsHeld(pageSize)
+		guest.pools = maxUint64(running, poolsHeld)
+		if err := refusePodCeilingsPastGuest(reservations, copied, running, poolsHeld, applied, guest, c.id, containerDisplayName(c.config)); err != nil {
+			return guestCapacityRefusal{err}
+		}
 		held := hugePagesTotalOCI(c.config.Resources.HugepageLimits, pageSize)
 		foldHeldHugePages(grpcResources, pageSize, held)
 		own, _ := ownHugePages(held, copied, false)
@@ -2726,7 +2713,7 @@ func (k *kataAgent) updateContainer(ctx context.Context, sandbox *Sandbox, c Con
 			return err
 		}
 		if err := k.boundContainerInGuest(grpcResources, guest, copied, usedBy, containerDisplayName(c.config)); err != nil {
-			return err
+			return guestCapacityRefusal{err}
 		}
 	}
 
@@ -2738,6 +2725,9 @@ func (k *kataAgent) updateContainer(ctx context.Context, sandbox *Sandbox, c Con
 	_, err = k.sendReq(ctx, req)
 	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
 		return grpcStatus.Errorf(codes.DeadlineExceeded, "UpdateContainerRequest timed out")
+	}
+	if err == nil && hugePagePodSized(&sandbox.config.HypervisorConfig) {
+		k.recordApplied(c.id, grpcResources, k.appliedPool(c.id))
 	}
 	return err
 }

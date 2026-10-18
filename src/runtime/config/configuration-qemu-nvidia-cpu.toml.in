@@ -296,12 +296,12 @@ reclaim_guest_freed_memory = false
 # result in memory pre allocation
 enable_hugepages = false
 
-# Size a huge page backed VM from the pod's hugepages-<size> reservation
-# rather than from default_memory plus the pod's memory limits, and bound each
-# container inside the guest by its own reservation, unless hugepages_used_by
-# keeps the container's huge pages for the guest. Needs enable_hugepages,
-# static_sandbox_resource_mgmt and sandbox_cgroup_only. Give it a runtime class
-# of its own, whose pod overhead covers the host processes in memory.
+# Size a huge page backed VM from the pod's hugepages-<size> reservation and
+# bound each container in the guest by its own (see hugepages_used_by). Needs
+# enable_hugepages, static_sandbox_resource_mgmt and sandbox_cgroup_only. The
+# pod or the runtime class's pod overhead declares the guest's own room in pages:
+# VM/64 + 128 MiB + min(768 MiB + MemTotal/512 + 24 MiB per vCPU, MemTotal/4),
+# and the overhead's memory covers the host processes.
 # Default false
 enable_hugepages_pod_sizing = false
 
