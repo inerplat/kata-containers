@@ -993,8 +993,7 @@ pub struct MemoryInfo {
     /// - if memory limits are provided: use `overhead_memory + workload_memory`
     /// - if the guest RAM comes from the hugetlb pool (`enable_hugepages` with
     ///   `hugepage_type = "hugetlbfs"`) and `enable_hugepages_pod_sizing` is
-    ///   set: use `default_memory` whatever the limits are; the pod reserves
-    ///   that memory as `hugepages-<size>`
+    ///   set: use the pod's `hugepages-<size>` reservation
     #[serde(default)]
     pub overhead_memory: u32,
 
@@ -1020,10 +1019,13 @@ pub struct MemoryInfo {
     pub enable_hugepages: bool,
 
     /// Sizes a guest backed by hugetlbfs from the pod's `hugepages-<size>`
-    /// reservation in the Go runtime. runtime-rs refuses it until it follows
-    /// the same rules.
+    /// reservation and bounds each container in the guest by its own.
     #[serde(default)]
     pub enable_hugepages_pod_sizing: bool,
+
+    /// Who uses a container's `hugepages-<size>` as huge pages: `host` (default) or `guest`.
+    #[serde(default)]
+    pub hugepages_used_by: String,
 
     /// Huge page type:
     /// - `hugetlbfs`
@@ -1225,13 +1227,13 @@ impl MemoryInfo {
                 "Configured memory slots for guest VM are zero",
             ));
         }
-        // runtime-rs does not size the guest from the pod or bound containers
-        // the way the Go runtime does, so the key is refused rather than given
-        // a different meaning here.
-        if self.enable_hugepages_pod_sizing {
-            return Err(std::io::Error::other(
-                "enable_hugepages_pod_sizing is not supported by runtime-rs yet: use the Go runtime for this runtime class",
-            ));
+        if self.enable_hugepages_pod_sizing
+            && !matches!(self.hugepages_used_by.as_str(), "" | "host" | "guest")
+        {
+            return Err(std::io::Error::other(format!(
+                "hugepages_used_by {:?} is not host or guest",
+                self.hugepages_used_by
+            )));
         }
 
         Ok(())
@@ -2004,17 +2006,21 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_info_refuses_pod_sizing() {
+    fn test_memory_info_hugepages_used_by() {
         let mut mem = MemoryInfo {
             default_memory: 2048,
             memory_slots: 10,
+            hugepages_used_by: "pool".to_string(),
             ..Default::default()
         };
-        assert!(mem.validate().is_ok());
+        assert!(mem.validate().is_ok(), "only read with pod sizing on");
 
         mem.enable_hugepages_pod_sizing = true;
-        let err = mem.validate().unwrap_err();
-        assert!(err.to_string().contains("not supported by runtime-rs"));
+        assert!(mem.validate().is_err());
+        for ok in ["", "host", "guest"] {
+            mem.hugepages_used_by = ok.to_string();
+            assert!(mem.validate().is_ok(), "{}", ok);
+        }
     }
 
     #[test]

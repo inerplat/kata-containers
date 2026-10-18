@@ -148,8 +148,8 @@ func (k *kataAgent) recordApplied(id string, resources *grpc.LinuxResources, poo
 	if k.applied == nil {
 		k.applied = make(map[string]appliedShare)
 	}
-	share := appliedShare{pool: pool}
-	if resources != nil {
+	share := appliedShare{pool: pool, ceiling: k.applied[id].ceiling}
+	if resources != nil && resources.Memory != nil && resources.Memory.Limit != 0 {
 		share.ceiling = uint64(memoryLimitBytes(resources.Memory))
 	}
 	k.applied[id] = share

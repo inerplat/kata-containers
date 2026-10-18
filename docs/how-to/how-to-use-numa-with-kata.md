@@ -393,7 +393,7 @@ EOF
     sized from the pod's reservation, or refused for one. In the Go runtime
     that is QEMU and Cloud Hypervisor; Firecracker, StratoVirt, the remote
     hypervisor and the mock read none of the huge page knobs and keep
-    `default_memory`. runtime-rs keeps `default_memory` throughout.
+    `default_memory`. In runtime-rs that is Dragonball.
 
     A pod that reserves none of the guest's page size is refused, naming the
     resource to add and the cgroup that was read. A reservation above

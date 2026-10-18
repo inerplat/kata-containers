@@ -430,6 +430,8 @@ func TestRecordApplied(t *testing.T) {
 	assert.Equal(appliedShare{ceiling: 2 * gib, pool: 4 * gib}, k.appliedCopy()["a"])
 	k.recordApplied("a", &pb.LinuxResources{Memory: &pb.LinuxMemory{Limit: int64(8 * gib)}}, k.appliedPool("a"))
 	assert.Equal(appliedShare{ceiling: 8 * gib, pool: 4 * gib}, k.appliedCopy()["a"], "an update keeps the pool")
+	k.recordApplied("a", &pb.LinuxResources{CPU: &pb.LinuxCPU{Quota: 100000}}, k.appliedPool("a"))
+	assert.Equal(appliedShare{ceiling: 8 * gib, pool: 4 * gib}, k.appliedCopy()["a"], "an update without memory keeps the ceiling")
 	k.recordApplied("u", nil, 0)
 	assert.Equal(appliedShare{}, k.appliedCopy()["u"], "no limit, no ceiling")
 }
