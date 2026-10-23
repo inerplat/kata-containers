@@ -680,7 +680,7 @@ func TestConstrainGRPCSpec(t *testing.T) {
 	}
 
 	k := kataAgent{}
-	k.constrainGRPCSpec(g, true, true, "", true, nil, false, guestCapacity{}, 0, "", "")
+	k.constrainGRPCSpec(g, true, true, "", true, nil, false, guestCapacity{}, 0, "")
 
 	// Check nil fields
 	assert.Nil(g.Hooks)
@@ -1574,18 +1574,6 @@ func TestTranslateHostMemoryLimitToGuest(t *testing.T) {
 			expectedLimit: 4 * gib,
 		},
 		{
-			description: "the pools come out of what the guest holds for a ceiling",
-			resources: &pb.LinuxResources{
-				Memory: &pb.LinuxMemory{Limit: gib / 4},
-				HugepageLimits: []*pb.LinuxHugepageLimit{
-					{Pagesize: "1GB", Limit: 12 * uint64(gib)},
-				},
-			},
-			pageSize: "1GB",
-			guest:    guestCapacity{memoryMB: 16 * 1024, vCPUs: 4, pools: 4 << 30},
-			refused:  true,
-		},
-		{
 			description: "a reservation of another page size stays out of the ceiling",
 			resources: &pb.LinuxResources{
 				Memory: &pb.LinuxMemory{Limit: 2 * gib},
@@ -1731,14 +1719,6 @@ func TestHoldableGuestMemoryReserve(t *testing.T) {
 		assert.Less(holdable, int64(memTotalMB)<<20, tt.description)
 	}
 
-	// A guest huge page pool comes out of what the containers may use.
-	guest := guestCapacity{memoryMB: 16 * 1024, vCPUs: 4}
-	withPool := guest
-	withPool.pools = 4 << 30
-	assert.Equal(holdableGuestMemoryBytes(guest)-int64(4<<30), holdableGuestMemoryBytes(withPool))
-	withPool.pools = uint64(holdableGuestMemoryBytes(guest))
-	assert.Zero(holdableGuestMemoryBytes(withPool))
-
 	// The large guest keeps an eighth of what a thirty-second of the VM would
 	// have taken from it.
 	large := guestCapacity{memoryMB: 1024 * 1024, vCPUs: 64}
@@ -1763,8 +1743,8 @@ func TestCopiedReservation(t *testing.T) {
 		{
 			description: "reservations that fit the VM are each the container's own",
 			reservations: []podReservation{
-				{name: "app", hugePages: 8 * gib},
-				{name: "side"},
+				{id: "app", hugePages: 8 * gib},
+				{id: "side"},
 			},
 			vmMemory: 8 * gib,
 		},
@@ -1773,9 +1753,9 @@ func TestCopiedReservation(t *testing.T) {
 			// that states none of its own, so the sum runs past the VM.
 			description: "the value past what the pod could declare is the pod's",
 			reservations: []podReservation{
-				{name: "app", hugePages: 192 * gib},
-				{name: "side-a", hugePages: 200 * gib},
-				{name: "side-b", hugePages: 200 * gib},
+				{id: "app", hugePages: 192 * gib},
+				{id: "side-a", hugePages: 200 * gib},
+				{id: "side-b", hugePages: 200 * gib},
 			},
 			vmMemory: 200 * gib,
 			expected: 200 * gib,
@@ -1785,8 +1765,8 @@ func TestCopiedReservation(t *testing.T) {
 			// repeat yet and has to be caught on its size alone.
 			description: "a copy is caught before it repeats",
 			reservations: []podReservation{
-				{name: "app", hugePages: 32 * gib},
-				{name: "side-a", hugePages: 40 * gib},
+				{id: "app", hugePages: 32 * gib},
+				{id: "side-a", hugePages: 40 * gib},
 			},
 			vmMemory: 40 * gib,
 			expected: 40 * gib,
@@ -1796,20 +1776,10 @@ func TestCopiedReservation(t *testing.T) {
 			// allowance, so the copy is not the VM's size.
 			description: "a copy is caught when the VM carries the class's overhead",
 			reservations: []podReservation{
-				{name: "main", hugePages: 10 * gib},
-				{name: "s1", hugePages: 16 * gib},
-				{name: "s2", hugePages: 16 * gib},
-				{name: "s3", hugePages: 16 * gib},
-			},
-			vmMemory: 18 * gib,
-			expected: 16 * gib,
-		},
-		{
-			description: "a copy beside a guest container is caught with the class's overhead",
-			reservations: []podReservation{
-				{name: "main", hugePages: 8 * gib},
-				{name: "pool", hugePages: 4 * gib, pool: true},
-				{name: "s2", hugePages: 16 * gib},
+				{id: "main", hugePages: 10 * gib},
+				{id: "s1", hugePages: 16 * gib},
+				{id: "s2", hugePages: 16 * gib},
+				{id: "s3", hugePages: 16 * gib},
 			},
 			vmMemory: 18 * gib,
 			expected: 16 * gib,
@@ -1817,24 +1787,24 @@ func TestCopiedReservation(t *testing.T) {
 		{
 			description: "containers that stated their own and fit the VM with its overhead are none of them a copy",
 			reservations: []podReservation{
-				{name: "main", hugePages: 8 * gib},
-				{name: "s-hp", hugePages: 1 * gib},
-				{name: "s-nomem", hugePages: 2 * gib},
+				{id: "main", hugePages: 8 * gib},
+				{id: "s-hp", hugePages: 1 * gib},
+				{id: "s-nomem", hugePages: 2 * gib},
 			},
 			vmMemory: 13 * gib,
 		},
 		{
 			description: "a lone container is read as having stated its own",
 			reservations: []podReservation{
-				{name: "app", hugePages: 12 * gib},
+				{id: "app", hugePages: 12 * gib},
 			},
 			vmMemory: 12 * gib,
 		},
 		{
 			description: "a guest of unknown size settles nothing",
 			reservations: []podReservation{
-				{name: "app", hugePages: 8 * gib},
-				{name: "side", hugePages: 8 * gib},
+				{id: "app", hugePages: 8 * gib},
+				{id: "side", hugePages: 8 * gib},
 			},
 		},
 		{
@@ -1842,18 +1812,18 @@ func TestCopiedReservation(t *testing.T) {
 			// would leave the holder bounded by its memory limit again.
 			description: "a holder down for the whole allowance keeps it",
 			reservations: []podReservation{
-				{name: "app", hugePages: 100 * gib},
-				{name: "side", hugePages: 100 * gib},
+				{id: "app", hugePages: 100 * gib},
+				{id: "side", hugePages: 100 * gib},
 			},
 			vmMemory: 100 * gib,
 		},
 		{
 			description: "a holder and its sidecars, all carrying the allowance, keep it",
 			reservations: []podReservation{
-				{name: "app", hugePages: 1536 * gib},
-				{name: "side-a", hugePages: 1536 * gib},
-				{name: "side-b", hugePages: 1536 * gib},
-				{name: "side-c", hugePages: 1536 * gib},
+				{id: "app", hugePages: 1536 * gib},
+				{id: "side-a", hugePages: 1536 * gib},
+				{id: "side-b", hugePages: 1536 * gib},
+				{id: "side-c", hugePages: 1536 * gib},
 			},
 			vmMemory: 1536 * gib,
 		},
@@ -1862,8 +1832,8 @@ func TestCopiedReservation(t *testing.T) {
 			// VM. Neither carries the allowance, so neither is a copy.
 			description: "containers that each stated their own are none of them a copy",
 			reservations: []podReservation{
-				{name: "app", hugePages: 60 * gib},
-				{name: "side", hugePages: 60 * gib},
+				{id: "app", hugePages: 60 * gib},
+				{id: "side", hugePages: 60 * gib},
 			},
 			vmMemory: 100 * gib,
 		},
@@ -1880,7 +1850,6 @@ func TestOwnHugePages(t *testing.T) {
 		description string
 		hugePages   uint64
 		copied      uint64
-		pool        bool
 		expected    uint64
 		expectWhy   bool
 	}{
@@ -1897,19 +1866,13 @@ func TestOwnHugePages(t *testing.T) {
 			expectWhy:   true,
 		},
 		{
-			description: "a reservation that bought a guest pool is not a ceiling",
-			hugePages:   8 * gib,
-			pool:        true,
-			expectWhy:   true,
-		},
-		{
 			description: "nothing to settle leaves the reservation alone",
 			hugePages:   8 * gib,
 			expected:    8 * gib,
 		},
 	} {
 		assert := assert.New(t)
-		own, why := ownHugePages(tt.hugePages, tt.copied, tt.pool)
+		own, why := ownHugePages(tt.hugePages, tt.copied)
 		assert.Equal(tt.expected, own, tt.description)
 		assert.Equal(tt.expectWhy, why != "", tt.description)
 	}
@@ -1922,21 +1885,4 @@ func TestContainerDisplayName(t *testing.T) {
 		Annotations: map[string]string{ctrAnnotations.ContainerName: "app"},
 	}))
 	assert.Equal("7de8d0f89ae5", containerDisplayName(&ContainerConfig{ID: "7de8d0f89ae5"}))
-}
-
-// Once handleHugepages has rewritten the mount to its guest path, only the
-// flag recorded before tells that the container has a pool.
-func TestContainerHasGuestHugePagePool(t *testing.T) {
-	assert := assert.New(t)
-
-	rewritten := &specs.Spec{Mounts: []specs.Mount{{
-		Source:      filepath.Join(ephemeralPath(), "hp"),
-		Destination: "/hp",
-		Type:        "bind",
-	}}}
-
-	notPodSized := &Sandbox{config: &SandboxConfig{}}
-	assert.False(containerHasGuestHugePagePool(notPodSized, &ContainerConfig{CustomSpec: rewritten}, 0))
-	assert.True(containerHasGuestHugePagePool(notPodSized, &ContainerConfig{CustomSpec: rewritten, GuestHugePagePool: true}, 0))
-	assert.False(containerHasGuestHugePagePool(notPodSized, &ContainerConfig{}, 0))
 }

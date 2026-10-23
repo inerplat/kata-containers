@@ -108,13 +108,11 @@ impl VirtContainerManager {
             if id == except {
                 continue;
             }
-            if let Some((id, name, sandbox, resources)) = c.reservation().await {
+            if let Some((id, resources)) = c.reservation().await {
                 others.push(Reservation {
                     id,
-                    name,
                     huge_pages: hugepages::huge_pages_of(resources.as_ref(), &page),
                     memory: hugepages::memory_limit(resources.as_ref()),
-                    sandbox,
                 });
             }
         }

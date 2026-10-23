@@ -1023,10 +1023,6 @@ pub struct MemoryInfo {
     #[serde(default)]
     pub enable_hugepages_pod_sizing: bool,
 
-    /// Who uses a container's `hugepages-<size>` as huge pages: `host` (default) or `guest`.
-    #[serde(default)]
-    pub hugepages_used_by: String,
-
     /// Huge page type:
     /// - `hugetlbfs`
     /// - `thp`
@@ -1226,14 +1222,6 @@ impl MemoryInfo {
             return Err(std::io::Error::other(
                 "Configured memory slots for guest VM are zero",
             ));
-        }
-        if self.enable_hugepages_pod_sizing
-            && !matches!(self.hugepages_used_by.as_str(), "" | "host" | "guest")
-        {
-            return Err(std::io::Error::other(format!(
-                "hugepages_used_by {:?} is not host or guest",
-                self.hugepages_used_by
-            )));
         }
 
         Ok(())
@@ -2003,24 +1991,6 @@ mod tests {
 
         assert!(get_hypervisor_plugin("dragonball").is_some());
         assert!(get_hypervisor_plugin("dragonball2").is_none());
-    }
-
-    #[test]
-    fn test_memory_info_hugepages_used_by() {
-        let mut mem = MemoryInfo {
-            default_memory: 2048,
-            memory_slots: 10,
-            hugepages_used_by: "pool".to_string(),
-            ..Default::default()
-        };
-        assert!(mem.validate().is_ok(), "only read with pod sizing on");
-
-        mem.enable_hugepages_pod_sizing = true;
-        assert!(mem.validate().is_err());
-        for ok in ["", "host", "guest"] {
-            mem.hugepages_used_by = ok.to_string();
-            assert!(mem.validate().is_ok(), "{}", ok);
-        }
     }
 
     #[test]

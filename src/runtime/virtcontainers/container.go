@@ -246,10 +246,6 @@ type ContainerConfig struct {
 	// Raw OCI specification, it won't be saved to disk.
 	CustomSpec *specs.Spec `json:"-"`
 
-	// handleHugepages rewrites a huge page backed emptyDir mount in CustomSpec to
-	// its guest path, so whether the container has a guest pool is kept here.
-	GuestHugePagePool bool `json:"-"`
-
 	// Annotations allow clients to store arbitrary values,
 	// for example to add additional status values required
 	// to support particular specifications.
@@ -1883,7 +1879,9 @@ func (c *Container) update(ctx context.Context, resources specs.LinuxResources) 
 		c.config.Resources.Memory.Limit = mem.Limit
 	}
 
-	c.config.Resources.HugepageLimits, resources.HugepageLimits = updatedHugepageLimits(c.config.Resources.HugepageLimits, resources.HugepageLimits)
+	if hugePagePodSized(&c.sandbox.config.HypervisorConfig) {
+		c.config.Resources.HugepageLimits, resources.HugepageLimits = updatedHugepageLimits(c.config.Resources.HugepageLimits, resources.HugepageLimits)
+	}
 
 	if err := c.sandbox.updateResources(ctx); err != nil {
 		return err

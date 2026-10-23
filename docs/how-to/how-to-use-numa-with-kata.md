@@ -250,45 +250,25 @@ EOF
 > pinning. The large `limits.cpu` value tells Kata to create a VM with
 > that many vCPUs distributed across NUMA nodes.
 
-!!! tip "Huge page backed guests"
+!!! tip "Huge page backed guests sized from the pod"
 
-    A huge page backed guest (`enable_hugepages = true`) sized once at start
-    (`static_sandbox_resource_mgmt = true`) with the hypervisor in the pod's
-    cgroup (`sandbox_cgroup_only = true`) is sized from the pod's
-    `hugepages-<size>` reservation, not from its `memory` limit. The CRI does
-    not pass that reservation to the runtime, so the runtime reads the
-    `hugetlb.<size>.max` the kubelet set on the pod's cgroup. `default_memory`
-    is the smallest guest the runtime boots, and the size used when the pod
-    states no reservation (outside Kubernetes, or without the hugetlb
-    controller). The `memory` limit only covers what the sandbox uses outside
-    the guest, so it can stay small and the pod still be Guaranteed:
+    With `enable_hugepages_pod_sizing = true`, a huge page backed guest
+    (`enable_hugepages = true`, `static_sandbox_resource_mgmt = true`,
+    `sandbox_cgroup_only = true`) is sized from the pod's `hugepages-<size>`
+    reservation. The CRI does not pass that reservation to the runtime, so the
+    runtime reads the `hugetlb.<size>.max` the kubelet set on the pod's cgroup,
+    which includes the runtime class's pod overhead. `default_memory` is the
+    size only when the pod states no reservation.
 
-    ```yaml
-    resources:
-      requests: { cpu: "80", memory: 2Gi, hugepages-1Gi: 64Gi }
-      limits:   { cpu: "80", memory: 2Gi, hugepages-1Gi: 64Gi }
-    ```
+    Inside the guest, a container's own `hugepages-<size>` is its memory
+    ceiling, and its `memory` limit is not used there. `memory` only covers
+    what the sandbox uses on the host, so it can stay small and the pod still
+    be Guaranteed. A container without a reservation keeps its `memory` limit
+    as its ceiling.
 
-    That guest is 64Gi. Inside it the reserved pages are ordinary RAM, so
-    each container's ceiling is its `memory` limit plus its own huge page
-    reservation, exactly as the pod declared it. The agent bounds the pod's
-    containers together on their parent cgroup at what the guest reports less
-    what the guest keeps. A guest reports about 1.6% less than the VM was
-    given, the page metadata its kernel spends on every 4KiB page, and it
-    keeps a share of the rest for its kernel, the drivers it loads for the
-    devices it was given, the agent and the free pages its allocator needs:
-    a fixed share, a slice that grows with the size and a term per vCPU. A
-    guest of 1TiB on 64 vCPUs with eight GPUs holds 2.5GiB of its own, one of
-    16GiB on 4 vCPUs a third of a GiB. Without that bound a leaking sidecar ends in the
-    guest's global OOM killer, which prefers the guest's own processes
-    (oom_score_adj 0) over a Guaranteed workload (-997) and leaves the pod
-    nothing to report.
-
-    The containers' ceilings can add up to more than that bound, and then the
-    pod is stopped by it rather than by its own limits. Give the guest its own
-    share instead of taking it from the workload: declare it as the runtime
-    class's pod overhead, which the kubelet adds to the pod's cgroup and the
-    scheduler counts against the node.
+    The guest also needs memory of its own, which grows with its size. Declare
+    it as `hugepages-<size>` in the runtime class's pod overhead, or as a pod
+    level value above the containers' sum:
 
     ```yaml
     kind: RuntimeClass
@@ -297,17 +277,12 @@ EOF
       podFixed:
         cpu: "1"
         memory: 1Gi
-        hugepages-1Gi: 4Gi
+        hugepages-1Gi: 2Gi
     ```
 
-    A pod whose containers reserve 16Gi then gets a 20Gi guest, each container
-    keeps the ceiling its pod declared, and a node without the extra 4Gi never
-    schedules the pod.
-
-    A sidecar that reserves no huge pages keeps its `memory` limit as its
-    ceiling. A sidecar that needs guest memory reserves it as
-    `hugepages-<size>`, which also grows the guest; asking for it as `memory`
-    charges the node's ordinary memory for RAM the pod already reserved.
+    A pod in this class whose containers reserve 14Gi and 2Gi gets an 18Gi
+    guest, with ceilings of 14Gi and 2Gi. The formula for the guest's own
+    share is in the comment on `enable_hugepages_pod_sizing`.
 
     To read a container's ceiling and to see a pod-level OOM:
 
@@ -317,98 +292,36 @@ EOF
     # pod-level: oom_memcg=/kubepods-pod<uid>.slice/cri-containerd (not a container's cgroup)
     ```
 
-    An agent older than the runtime ignores the pod-level bound; a runtime
-    older than the agent never sets it. Either way the containers keep their
-    own ceilings.
-
-!!! note "Huge pages inside the guest"
-
-    These rules apply when the runtime class sets `enable_hugepages_pod_sizing = true`.
-    `hugepages_used_by` in the same section says who uses a container's
-    `hugepages-<size>` of the VM's page size as huge pages:
-
-    | Value | `hugepages-<size>` | `memory` |
-    |---|---|---|
-    | `host` (default) | backs the VM, and is the container's guest memory ceiling | not used inside the guest |
-    | `guest` | stays huge pages inside the guest, as on runc | the container's guest memory ceiling |
-
-    The pod annotation `io.katacontainers.container.hugepages_used_by` overrides
-    it per container. In a `host` class, a container that needs huge pages
-    inside the guest is named as `guest`:
-
-    ```yaml
-    metadata:
-      annotations:
-        io.katacontainers.container.hugepages_used_by: "nvmf=guest"
-    spec:
-      runtimeClassName: kata-qemu-hugepage-sized
-      containers:
-      - name: trainer
-        resources:
-          limits:
-            memory: 256Mi
-            hugepages-1Gi: 64Gi
-      - name: nvmf
-        resources:
-          limits:
-            memory: 2Gi
-            hugepages-1Gi: 4Gi
-    ```
-
-    `trainer` is bounded at 64Gi and cannot take the guest's huge pages. `nvmf`
-    gets 4Gi of huge pages in the guest and is bounded at 2Gi. They exist
-    whether or not the container mounts a huge page backed `emptyDir`; mount one
-    only when the application wants a hugetlbfs path. The huge pages of a pod's
-    `guest` containers add up in the guest and are never shrunk while the pod
-    runs. A container that reserves none of its own, including one that only
-    carries the pod's value, is `host` even in a `guest` class.
-
-    Refused when the container is created:
-
-    - a huge page backed `emptyDir` on a `host` container;
-    - a container named `guest` that reserves none of the VM's page size of its own;
-    - huge pages of another page size than the VM's;
-    - ceilings and guest huge pages that together do not fit the guest, with
-      the amount the pod is short;
-    - containers that all carry the same pod level value past the VM's size;
-    - a change of the annotation while the pod runs.
-
-!!! warning "`hugepages-<size>` has to cover `default_memory`"
-
-    A reservation below `default_memory` is refused before the VM starts. The
-    kubelet writes the pod's reservation to both `hugetlb.<size>.max` and
-    `hugetlb.<size>.rsvd.max` on the pod's cgroup, and the reserve counter is
-    charged when the hypervisor maps the guest's RAM, not when the guest first
-    touches it. A VM larger than the reservation therefore cannot map its
-    memory at all, whether or not it faults the pages in at start:
-
-    ```
-    the VM is backed by huge pages, but its pod reserved 2048 MiB of
-    hugepages-1Gi, less than the 4096 MiB of default_memory the VM boots with:
-    request at least that much on a container of the pod (pod cgroup
-    /kubepods.slice/kubepods-pod<uid>.slice)
-    ```
+    The Go runtime also has the agent bound the pod's containers together on
+    their parent cgroup, so a pod that outgrows the guest is stopped there
+    rather than by the guest's OOM killer. An agent older than the runtime
+    ignores that bound.
 
     Only a hypervisor that takes the guest's RAM from the huge page pool is
-    sized from the pod's reservation, or refused for one. In the Go runtime
-    that is QEMU and Cloud Hypervisor; Firecracker, StratoVirt, the remote
-    hypervisor and the mock read none of the huge page knobs and keep
-    `default_memory`. In runtime-rs that is Dragonball.
+    sized this way: QEMU and Cloud Hypervisor in the Go runtime, Dragonball in
+    runtime-rs. Without `sandbox_cgroup_only` the hypervisor runs outside the
+    pod's cgroup and the guest stays at `default_memory`.
 
-    A pod that reserves none of the guest's page size is refused, naming the
-    resource to add and the cgroup that was read. A reservation above
-    `default_maxmemory`, when set, is refused. A reservation above
-    `default_memory` sizes the guest; the size is logged before the VM starts:
+!!! note "Refused pods"
+
+    Refused before the VM starts:
+
+    - a pod that reserved none of the guest's page size;
+    - a reservation under 1024 MiB, or above `default_maxmemory` when set.
+
+    Refused when a container is created or updated:
+
+    - a huge page backed `emptyDir`, since huge pages inside the guest are not
+      supported in such a runtime class;
+    - huge pages of another page size than the VM's;
+    - ceilings that together do not fit the guest, with the amount the pod is short;
+    - containers that all carry the same pod level value past the VM's size.
+
+    A container reserving 16Gi in a class without huge pages in its overhead:
 
     ```
-    sizing the huge page backed VM from the pod's huge page reservation
-    pod-resource=hugepages-1Gi reserved-mb=65536 default-memory-mb=4096
+    container app brings the memory ceilings of the pod's containers to 16384 MiB, but the 16384 MiB guest holds 15129 MiB for them: the pod needs 1255 MiB more of the VM's huge pages, on the pod or as the runtime class's pod overhead
     ```
-
-    The reservation is the pod's, so with several containers their sum sizes
-    the guest. Without `sandbox_cgroup_only` the hypervisor runs outside the
-    pod's cgroup and the reservation does not bound it: the guest stays at
-    `default_memory`.
 
 ### 4.2 GPU passthrough pod with NUMA
 

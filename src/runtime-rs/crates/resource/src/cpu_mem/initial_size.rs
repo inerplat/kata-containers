@@ -186,13 +186,9 @@ impl InitialSizeManager {
             return Ok(());
         }
 
-        // A guest that takes its memory from the hugetlb pool is not sized by
-        // the workload's memory limit: that limit is charged against ordinary
-        // memory, which such a guest never touches, while the memory it does
-        // run on is reserved by the pod as a hugepages-<size> resource.
-        // Sizing the VM from the limit would size it against the wrong
-        // resource, so the pod's hugetlb reservation sizes it below.
-        // Transparent huge pages are ordinary memory and are sized as usual.
+        // A hugetlbfs backed guest runs on what the pod reserves as hugepages-<size>,
+        // not on its memory limit, so that reservation sizes it below. Transparent
+        // huge pages are ordinary memory and are sized as usual.
         let hugetlb_backed = hv.memory_info.enable_hugepages
             && hv.memory_info.enable_hugepages_pod_sizing
             && matches!(hv.memory_info.hugepage_type, HugePageType::Hugetlbfs);

@@ -29,13 +29,12 @@ use oci::{LinuxResources, Process as OCIProcess};
 use resource::{
     cdi_devices::container_device::annotate_container_devices,
     cpu_mem::hugepage_sizing::{hugepages_resource_name, hugetlb_size_name, vm_huge_page_size},
-    share_fs::ephemeral_path,
     ResourceManager, ResourceUpdateOp,
 };
 use tokio::sync::RwLock;
 
 use super::{
-    hugepages::{self, Guest, HugePageBook, Reservation, USED_BY_GUEST},
+    hugepages::{self, Guest, HugePageBook, Reservation},
     process::{Process, ProcessWatcher},
     ContainerInner,
 };
@@ -55,12 +54,8 @@ pub(crate) struct PodHugePages {
 // What a container is given in a guest sized from the pod.
 struct HugePagePlan {
     page: String,
-    page_bytes: u64,
     guest: Guest,
     copied: u64,
-    used_by: &'static str,
-    own: u64,
-    pools: u64,
 }
 
 pub struct Container {
@@ -229,36 +224,10 @@ impl Container {
         }
         spec.set_mounts(Some(oci_mounts));
 
-        if let Some(plan) = &plan {
-            let mounts_pool = storages.iter().any(|s| s.fs_type == hypervisor::HUGETLBFS);
-            if mounts_pool && plan.used_by != USED_BY_GUEST {
-                return Err(anyhow!(
-                    "container {container_name} mounts a huge page volume, but the host uses its huge pages here: name it {container_name}={USED_BY_GUEST} in the pod annotation {}",
-                    hugepages::ANNOTATION
-                ));
-            }
-            if plan.used_by == USED_BY_GUEST {
-                // The agent sets nr_hugepages from each storage: carry the pod's total.
-                let option = format!("pagesize={},size={}", plan.page_bytes, plan.pools);
-                for s in storages
-                    .iter_mut()
-                    .filter(|s| s.fs_type == hypervisor::HUGETLBFS)
-                {
-                    s.options = vec![option.clone()];
-                }
-                storages.push(agent::Storage {
-                    driver: kata_types::mount::KATA_EPHEMERAL_VOLUME_TYPE.to_string(),
-                    source: "nodev".to_string(),
-                    fs_type: hypervisor::HUGETLBFS.to_string(),
-                    mount_point: format!(
-                        "{}/kata-hugepage-pool-{}",
-                        ephemeral_path(),
-                        config.container_id
-                    ),
-                    options: vec![option],
-                    ..Default::default()
-                });
-            }
+        if plan.is_some() && storages.iter().any(|s| s.fs_type == hypervisor::HUGETLBFS) {
+            return Err(anyhow!(
+                "container {container_name} mounts a huge page volume, but huge pages inside the guest are not supported in a runtime class with enable_hugepages_pod_sizing"
+            ));
         }
 
         let linux = spec
@@ -299,9 +268,7 @@ impl Container {
                         resource,
                         &plan.page,
                         plan.guest,
-                        plan.pools,
                         plan.copied,
-                        plan.used_by,
                         &container_name,
                     )?;
                 }
@@ -389,26 +356,12 @@ impl Container {
             .map(|res| hugepages::memory_limit(Some(res)) as u64)
             .unwrap_or(0);
         let created = self.agent.create_container(r).await;
-        if let (Some(plan), Some(pod)) = (&plan, pod) {
-            let mut book = pod.book.lock().await;
-            // The agent keeps the pages of a create that failed after its storages.
-            if plan.used_by == USED_BY_GUEST {
-                book.pool_high_water = book.pool_high_water.max(plan.pools);
-            }
-            if created.is_ok() {
-                let pool = if plan.used_by == USED_BY_GUEST {
-                    plan.own
-                } else {
-                    0
-                };
-                book.applied.insert(
-                    config.container_id.clone(),
-                    hugepages::Applied {
-                        ceiling: applied_ceiling,
-                        pool,
-                    },
-                );
-            }
+        if let (Some(pod), Some(_), Ok(_)) = (pod, &plan, &created) {
+            pod.book
+                .lock()
+                .await
+                .applied
+                .insert(config.container_id.clone(), applied_ceiling);
         }
         created.context("agent create container")?;
         self.resource_manager.dump().await;
@@ -430,10 +383,8 @@ impl Container {
         let resources = spec.linux().as_ref().and_then(|l| l.resources().as_ref());
         let this = Reservation {
             id: self.config.container_id.clone(),
-            name: name.to_string(),
             huge_pages: hugepages::huge_pages_of(resources, &page),
             memory: hugepages::memory_limit(resources),
-            sandbox: container_type(spec) == kata_types::container::ContainerType::PodSandbox,
         };
         let mut rs = pod.others.clone();
         rs.push(this.clone());
@@ -445,73 +396,23 @@ impl Container {
             ));
         }
         let copied = hugepages::copied_reservation(&rs, vm_bytes);
-        let own = hugepages::own(this.huge_pages, copied);
-
-        let mut book = pod.book.lock().await;
-        let annotation = spec
-            .annotations()
-            .as_ref()
-            .and_then(|a| a.get(hugepages::ANNOTATION))
-            .cloned()
-            .unwrap_or_default();
-        match &book.annotation {
-            None => book.annotation = Some(annotation),
-            Some(started) if *started != annotation => {
-                return Err(anyhow!(
-                    "annotation {} changed from {started:?} to {annotation:?} after the pod started: it cannot change while the pod runs",
-                    hugepages::ANNOTATION
-                ))
-            }
-            Some(_) => {}
-        }
-        let entries = hugepages::parse_used_by(book.annotation.as_deref().unwrap_or(""))?;
-        let class = class_used_by(toml_config);
-        let used_by = hugepages::used_by(&class, &entries, &this, own);
-        if used_by == USED_BY_GUEST && own == 0 {
-            return Err(anyhow!(
-                "container {name} keeps its huge pages for the guest but reserves no {resource} of its own: give it one in its resources"
-            ));
-        }
-        let pools = |r: &Reservation| {
-            hugepages::used_by(&class, &entries, r, hugepages::own(r.huge_pages, copied))
-                == USED_BY_GUEST
-        };
-        let running = hugepages::pod_pools(&rs, copied, &pools, &book.applied, &this.id);
-        let held = book.pool_high_water;
-        hugepages::refuse_pod_ceilings(
-            &rs,
-            copied,
-            &pools,
-            running,
-            held,
-            &book.applied,
-            guest,
-            &this.id,
-            name,
-        )?;
+        let book = pod.book.lock().await;
+        hugepages::refuse_pod_ceilings(&rs, copied, &book.applied, guest, &this.id, name)?;
         Ok(HugePagePlan {
             page,
-            page_bytes,
             guest,
             copied,
-            used_by,
-            own,
-            pools: running.max(held),
         })
     }
 
     /// What the container carries for the pod's huge page checks, None once it stopped.
-    pub(crate) async fn reservation(
-        &self,
-    ) -> Option<(String, String, bool, Option<LinuxResources>)> {
+    pub(crate) async fn reservation(&self) -> Option<(String, Option<LinuxResources>)> {
         let inner = self.inner.read().await;
         if inner.init_process.get_status().await == ProcessStatus::Stopped {
             return None;
         }
         Some((
             self.config.container_id.clone(),
-            k8s::container_name(&self.spec),
-            container_type(&self.spec) == kata_types::container::ContainerType::PodSandbox,
             inner.linux_resources.clone(),
         ))
     }
@@ -970,45 +871,15 @@ impl Container {
             let name = k8s::container_name(&self.spec);
             let this = Reservation {
                 id: self.config.container_id.clone(),
-                name: name.clone(),
                 huge_pages: held,
                 memory,
-                sandbox: container_type(&self.spec)
-                    == kata_types::container::ContainerType::PodSandbox,
             };
             let mut rs = pod.others.clone();
             rs.push(this.clone());
             let copied = hugepages::copied_reservation(&rs, guest.memory_mib << 20);
             let book = pod.book.lock().await;
-            let entries = hugepages::parse_used_by(book.annotation.as_deref().unwrap_or(""))?;
-            let class = class_used_by(&toml_config);
-            let pools = |r: &Reservation| {
-                hugepages::used_by(&class, &entries, r, hugepages::own(r.huge_pages, copied))
-                    == USED_BY_GUEST
-            };
-            let running = hugepages::pod_pools(&rs, copied, &pools, &book.applied, "");
-            let held_pool = book.pool_high_water;
-            hugepages::refuse_pod_ceilings(
-                &rs,
-                copied,
-                &pools,
-                running,
-                held_pool,
-                &book.applied,
-                guest,
-                &this.id,
-                &name,
-            )?;
-            let used_by = hugepages::used_by(&class, &entries, &this, hugepages::own(held, copied));
-            checked = Some((
-                page,
-                guest,
-                running.max(held_pool),
-                copied,
-                used_by,
-                held,
-                name,
-            ));
+            hugepages::refuse_pod_ceilings(&rs, copied, &book.applied, guest, &this.id, &name)?;
+            checked = Some((page, guest, copied, held, name));
         }
 
         let resources = if checked.is_some() {
@@ -1028,13 +899,11 @@ impl Container {
             )
             .await?;
 
-        if let (Some((page, guest, pools, copied, used_by, held, name)), Some(res)) =
+        if let (Some((page, guest, copied, held, name)), Some(res)) =
             (&checked, agent_resources.as_mut())
         {
             hugepages::fold_held(res, page, *held);
-            if let Err(e) =
-                hugepages::bound_container(res, page, *guest, *pools, *copied, used_by, name)
-            {
+            if let Err(e) = hugepages::bound_container(res, page, *guest, *copied, name) {
                 inner.linux_resources = previous;
                 return Err(e);
             }
@@ -1054,16 +923,11 @@ impl Container {
             .await
             .context("agent update container")?;
         if let (Some(pod), Some(_)) = (pod, &checked) {
-            let mut book = pod.book.lock().await;
-            let pool = book
+            pod.book
+                .lock()
+                .await
                 .applied
-                .get(&self.config.container_id)
-                .map(|a| a.pool)
-                .unwrap_or(0);
-            book.applied.insert(
-                self.config.container_id.clone(),
-                hugepages::Applied { ceiling, pool },
-            );
+                .insert(self.config.container_id.clone(), ceiling);
         }
         Ok(())
     }
@@ -1181,14 +1045,6 @@ pub(crate) fn is_pod_sized(toml_config: &TomlConfig) -> bool {
                 && hv.memory_info.enable_hugepages_pod_sizing
                 && matches!(hv.memory_info.hugepage_type, HugePageType::Hugetlbfs)
         })
-}
-
-fn class_used_by(toml_config: &TomlConfig) -> String {
-    toml_config
-        .hypervisor
-        .get(&toml_config.runtime.hypervisor_name)
-        .map(|hv| hv.memory_info.hugepages_used_by.clone())
-        .unwrap_or_default()
 }
 
 // The guest a statically sized sandbox boots, default when it grows on demand.
