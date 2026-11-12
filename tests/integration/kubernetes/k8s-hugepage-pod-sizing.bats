@@ -31,17 +31,18 @@ allocatable_hugepages() {
 	kubectl get node "$node" -o jsonpath='{.status.allocatable.hugepages-2Mi}'
 }
 
-# The kubelet reads the size of the huge page pool when it starts.
+# The kubelet reads the size of the huge page pool when it starts. systemctl
+# needs the host's PID namespace to reach systemd.
 set_host_hugepages() {
 	local pages="$1"
 	local expected="$2"
 
 	host_cmd "sysctl -w vm.nr_hugepages=${pages}"
-	host_cmd "systemctl --no-block restart kubelet" || true
+	exec_host "$node" "nsenter --target 1 --mount --uts --ipc --net --pid systemctl --no-block restart kubelet" || true
 
 	local cmd="[[ \"\$(kubectl get node $node -o jsonpath='{.status.allocatable.hugepages-2Mi}')\" == \"${expected}\" ]]"
-	waitForProcess 120 5 "$cmd"
-	kubectl wait --for=condition=Ready --timeout=120s "node/${node}"
+	waitForProcess 120 5 "$cmd" || return 1
+	kubectl wait --for=condition=Ready --timeout=120s "node/${node}" || return 1
 }
 
 setup() {
