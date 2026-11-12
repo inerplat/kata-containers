@@ -1300,6 +1300,7 @@ function install_cri_containerd() {
 	sudo mkdir -p /etc/containerd
 	sudo containerd config default \
 		| sed -E 's/^([[:space:]]*SystemdCgroup[[:space:]]*=[[:space:]]*)false/\1true/' \
+		| sed -E 's/^([[:space:]]*disable_hugetlb_controller[[:space:]]*=[[:space:]]*)true/\1false/' \
 		| sudo tee /etc/containerd/config.toml > /dev/null
 	ensure_containerd_conf_d_rootful_api_sockets
 
