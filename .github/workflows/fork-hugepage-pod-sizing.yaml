@@ -93,6 +93,14 @@ jobs:
       - name: Deploy k8s (kubeadm)
         run: bash tests/integration/kubernetes/gha-run.sh deploy-k8s
 
+      # containerd drops the containers' huge page limits by default.
+      - name: Let containerd pass huge page limits to the runtime
+        run: |
+          sudo sed -i -E 's/^([[:space:]]*disable_hugetlb_controller[[:space:]]*=[[:space:]]*)true/\1false/' /etc/containerd/config.toml
+          sudo systemctl restart containerd
+          sudo env PATH="${PATH}:/usr/local/bin" containerd config dump | grep disable_hugetlb_controller
+          kubectl wait --for=condition=Ready --timeout=180s node --all
+
       # The fork's package may be private.
       - name: Let the kubelet pull from the fork's registry
         run: |
