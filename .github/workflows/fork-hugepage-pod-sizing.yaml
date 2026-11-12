@@ -1,0 +1,212 @@
+# DO NOT MERGE. Runs k8s-hugepage-pod-sizing.bats on GitHub hosted runners
+# of a fork.
+name: fork | hugepage pod sizing bats
+on:
+  push:
+    branches:
+      - test/hugepage-pod-sizing-bats
+      - test/hugepage-pod-sizing-bats-v2
+      - test/hugepage-pod-sizing-bats-v3
+      - test/hugepage-pod-sizing-bats-v4
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-kata-static-tarball-amd64:
+    if: ${{ false }} # reusing the build of 5d571940bb76c184b60b9cca213e36a0890fb033
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build-kata-static-tarball-amd64.yaml
+    with:
+      tarball-suffix: -${{ github.sha }}-fork
+      commit-hash: ${{ github.sha }}
+      target-branch: ${{ github.ref_name }}
+    secrets:
+      KBUILD_SIGN_PIN: ${{ secrets.KBUILD_SIGN_PIN }}
+
+  publish-kata-deploy-image-amd64:
+    needs: build-kata-static-tarball-amd64
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-kata-images.yaml
+    with:
+      tarball-suffix: -${{ github.sha }}-fork
+      registry: ghcr.io
+      repo: ${{ github.repository_owner }}/kata-deploy-ci
+      tag: ${{ github.sha }}-fork-amd64
+      commit-hash: ${{ github.sha }}
+      target-branch: ${{ github.ref_name }}
+      runner: ubuntu-24.04
+      arch: amd64
+    secrets:
+      QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
+
+  run-hugepage-pod-sizing:
+    needs: publish-kata-deploy-image-amd64
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        vmm: [qemu, clh, dragonball]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    env:
+      DOCKER_REGISTRY: ghcr.io
+      DOCKER_REPO: ${{ github.repository_owner }}/kata-deploy-ci
+      DOCKER_TAG: 5d571940bb76c184b60b9cca213e36a0890fb033-fork-amd64
+      GH_PR_NUMBER: dev
+      KATA_HOST_OS: ubuntu
+      KATA_HYPERVISOR: ${{ matrix.vmm }}
+      KUBERNETES: vanilla
+      K8S_TEST_HOST_TYPE: baremetal-no-attestation
+      K8S_TEST_UNION: k8s-hugepage-pod-sizing.bats
+      CONTAINER_ENGINE: containerd
+      CONTAINER_ENGINE_VERSION: latest
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: get-kata-tools-tarball
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-tools-static-tarball-amd64-5d571940bb76c184b60b9cca213e36a0890fb033-fork
+          run-id: 43178313631
+          github-token: ${{ github.token }}
+          path: kata-tools-artifacts
+
+      - name: Install kata-tools
+        run: bash tests/integration/kubernetes/gha-run.sh install-kata-tools kata-tools-artifacts
+
+      - name: Reserve huge pages
+        run: sudo sysctl -w vm.nr_hugepages=768
+
+      - name: Deploy k8s (kubeadm)
+        run: bash tests/integration/kubernetes/gha-run.sh deploy-k8s
+
+      - name: Show containerd's huge page setting
+        run: sudo env PATH="${PATH}:/usr/local/bin" containerd config dump | grep disable_hugetlb_controller
+
+      # The fork's package may be private.
+      - name: Let the kubelet pull from the fork's registry
+        run: |
+          auth="$(printf '%s:%s' "${GITHUB_ACTOR}" "${GH_TOKEN}" | base64 -w0)"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${auth}" | sudo tee /var/lib/kubelet/config.json > /dev/null
+
+      - name: Install `bats`
+        run: bash tests/integration/kubernetes/gha-run.sh install-bats
+
+      - name: Deploy Kata
+        timeout-minutes: 20
+        run: bash tests/integration/kubernetes/gha-run.sh deploy-kata
+
+      - name: Run tests
+        timeout-minutes: 60
+        run: bash tests/integration/kubernetes/gha-run.sh run-tests
+
+      - name: Report tests
+        if: always()
+        run: bash tests/integration/kubernetes/gha-run.sh report-tests
+
+      - name: Delete kata-deploy
+        if: always()
+        timeout-minutes: 15
+        run: bash tests/integration/kubernetes/gha-run.sh cleanup
+
+  run-hugepage-pod-sizing-crio:
+    needs: publish-kata-deploy-image-amd64
+    if: ${{ !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Without the pages only the refusal runs, as on upstream's CRI-O job.
+        hugepages: [768, 0]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    env:
+      DOCKER_REGISTRY: ghcr.io
+      DOCKER_REPO: ${{ github.repository_owner }}/kata-deploy-ci
+      DOCKER_TAG: 5d571940bb76c184b60b9cca213e36a0890fb033-fork-amd64
+      GH_PR_NUMBER: dev
+      KATA_HOST_OS: ubuntu
+      KATA_HYPERVISOR: qemu
+      KUBERNETES: k0s
+      CONTAINER_RUNTIME: crio
+      KUBERNETES_EXTRA_PARAMS: '--cri-socket remote:unix:///var/run/crio/crio.sock --kubelet-extra-args --cgroup-driver="systemd"'
+      K8S_TEST_HOST_TYPE: baremetal-no-attestation
+      K8S_TEST_UNION: k8s-hugepage-pod-sizing.bats
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: get-kata-tools-tarball
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-tools-static-tarball-amd64-5d571940bb76c184b60b9cca213e36a0890fb033-fork
+          run-id: 43178313631
+          github-token: ${{ github.token }}
+          path: kata-tools-artifacts
+
+      - name: Install kata-tools
+        run: bash tests/integration/kubernetes/gha-run.sh install-kata-tools kata-tools-artifacts
+
+      # k0s runs the kubelet itself, so the pages are there before it starts.
+      - name: Reserve huge pages
+        run: |
+          sudo sysctl -w vm.nr_hugepages=${{ matrix.hugepages }}
+          grep -i huge /proc/meminfo
+
+      - name: Setup CRI-O
+        run: bash tests/integration/kubernetes/gha-run.sh setup-crio
+
+      - name: Deploy k8s (k0s)
+        run: bash tests/integration/kubernetes/gha-run.sh deploy-k8s
+
+      # The fork's package may be private.
+      - name: Let the kubelet pull from the fork's registry
+        run: |
+          auth="$(printf '%s:%s' "${GITHUB_ACTOR}" "${GH_TOKEN}" | base64 -w0)"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${auth}" | sudo tee /var/lib/k0s/kubelet/config.json > /dev/null
+          kubectl get node -o jsonpath='{.items[0].status.allocatable}'
+
+      - name: Install `bats`
+        run: bash tests/integration/kubernetes/gha-run.sh install-bats
+
+      - name: Deploy Kata
+        timeout-minutes: 20
+        run: bash tests/integration/kubernetes/gha-run.sh deploy-kata
+
+      - name: Run tests
+        timeout-minutes: 60
+        run: bash tests/integration/kubernetes/gha-run.sh run-tests
+
+      - name: Report tests
+        if: always()
+        run: bash tests/integration/kubernetes/gha-run.sh report-tests
+
+      - name: Delete kata-deploy
+        if: always()
+        timeout-minutes: 15
+        run: bash tests/integration/kubernetes/gha-run.sh cleanup
