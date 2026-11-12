@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   build-kata-static-tarball-amd64:
+    if: ${{ false }} # reusing the build of 5d571940bb76c184b60b9cca213e36a0890fb033
     permissions:
       contents: read
       packages: write
@@ -48,6 +49,7 @@ jobs:
 
   run-hugepage-pod-sizing:
     needs: publish-kata-deploy-image-amd64
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -57,10 +59,11 @@ jobs:
     permissions:
       contents: read
       packages: read
+      actions: read
     env:
       DOCKER_REGISTRY: ghcr.io
       DOCKER_REPO: ${{ github.repository_owner }}/kata-deploy-ci
-      DOCKER_TAG: ${{ github.sha }}-fork-amd64
+      DOCKER_TAG: 5d571940bb76c184b60b9cca213e36a0890fb033-fork-amd64
       GH_PR_NUMBER: dev
       KATA_HOST_OS: ubuntu
       KATA_HYPERVISOR: ${{ matrix.vmm }}
@@ -79,7 +82,9 @@ jobs:
       - name: get-kata-tools-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-tools-static-tarball-amd64-${{ github.sha }}-fork
+          name: kata-tools-static-tarball-amd64-5d571940bb76c184b60b9cca213e36a0890fb033-fork
+          run-id: 43178313631
+          github-token: ${{ github.token }}
           path: kata-tools-artifacts
 
       - name: Install kata-tools

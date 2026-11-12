@@ -31,14 +31,44 @@ allocatable_hugepages() {
 	kubectl get node "$node" -o jsonpath='{.status.allocatable.hugepages-2Mi}'
 }
 
-# The kubelet reads the size of the huge page pool when it starts. systemctl
-# needs the host's PID namespace to reach systemd.
+# The kubelet reads the size of the huge page pool when it starts. Only a pod
+# in the host's PID namespace can reach systemd to restart it.
+restart_kubelet() {
+	local pod="restart-kubelet-${RANDOM}"
+
+	kubectl apply -n kube-system -f - <<POD
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+spec:
+  hostPID: true
+  restartPolicy: Never
+  nodeName: ${node}
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: restart
+    image: quay.io/bedrock/ubuntu:latest
+    command: ["nsenter", "--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid", "systemctl", "restart", "kubelet"]
+    securityContext:
+      privileged: true
+POD
+	kubectl wait -n kube-system --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s "pod/${pod}" || {
+		kubectl describe -n kube-system "pod/${pod}"
+		kubectl logs -n kube-system "pod/${pod}"
+		kubectl delete -n kube-system "pod/${pod}" --ignore-not-found
+		return 1
+	}
+	kubectl delete -n kube-system "pod/${pod}" --ignore-not-found
+}
+
 set_host_hugepages() {
 	local pages="$1"
 	local expected="$2"
 
 	host_cmd "sysctl -w vm.nr_hugepages=${pages}"
-	exec_host "$node" "nsenter --target 1 --mount --uts --ipc --net --pid systemctl --no-block restart kubelet" || true
+	restart_kubelet || return 1
 
 	local cmd="[[ \"\$(kubectl get node $node -o jsonpath='{.status.allocatable.hugepages-2Mi}')\" == \"${expected}\" ]]"
 	waitForProcess 120 5 "$cmd" || return 1
@@ -153,7 +183,7 @@ teardown() {
 
 	kubectl describe pods || true
 	k8s_delete_all_pods_if_any_exists || true
-	kubectl delete runtimeclass "${sized_class:-}" --ignore-not-found || true
+	[[ -z "${sized_class:-}" ]] || kubectl delete runtimeclass "${sized_class}" --ignore-not-found || true
 
 	remove_kata_runtime_config_dropin_file "$node" "${dropin_path:-}" \
 		|| echo "Warning: Failed to remove Kata runtime config drop-in on node $node"
