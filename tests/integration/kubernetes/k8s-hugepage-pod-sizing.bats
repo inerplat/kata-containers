@@ -19,7 +19,6 @@ vm_mib=$((container_mib + overhead_mib))
 hugepage_pod_sizing_supported() {
 	[[ "${KATA_HYPERVISOR}" == "qemu" || "${KATA_HYPERVISOR}" == "clh" || "${KATA_HYPERVISOR}" == "dragonball" ]] || return 1
 	[[ "$(uname -m)" == "x86_64" ]] || return 1
-	[[ "${KUBERNETES:-}" == "vanilla" ]] || return 1
 	return 0
 }
 
@@ -29,6 +28,17 @@ host_cmd() {
 
 allocatable_hugepages() {
 	kubectl get node "$node" -o jsonpath='{.status.allocatable.hugepages-2Mi}'
+}
+
+allocatable_hugepages_mib() {
+	local quantity
+	quantity="$(allocatable_hugepages)"
+	case "${quantity}" in
+		*Gi) echo "$((${quantity%Gi} * 1024))" ;;
+		*Mi) echo "${quantity%Mi}" ;;
+		*Ki) echo "$((${quantity%Ki} / 1024))" ;;
+		*) echo "$((${quantity:-0} / 1024 / 1024))" ;;
+	esac
 }
 
 # The kubelet reads the size of the huge page pool when it starts. Only a pod
@@ -76,17 +86,24 @@ set_host_hugepages() {
 }
 
 setup() {
-	hugepage_pod_sizing_supported || skip "needs qemu, clh or dragonball on a x86_64 kubeadm node (KATA_HYPERVISOR=${KATA_HYPERVISOR})"
+	hugepage_pod_sizing_supported || skip "needs qemu, clh or dragonball on a x86_64 node (KATA_HYPERVISOR=${KATA_HYPERVISOR})"
 
 	setup_common || die "setup_common failed"
 
 	[[ "$(host_cmd "grep Hugepagesize /proc/meminfo" | awk '{print $2}')" == "2048" ]] \
 		|| skip "the node's default huge page size is not 2 MiB"
 
-	original_pages="$(host_cmd "cat /proc/sys/vm/nr_hugepages")"
-	original_allocatable="$(allocatable_hugepages)"
-	set_host_hugepages "$((original_pages + vm_mib / 2))" "$((original_pages * 2 + vm_mib))Mi" \
-		|| die "Failed to reserve ${vm_mib} MiB of huge pages on node $node"
+	# A node that already has the pages is used as it is. Only a kubeadm node's
+	# kubelet can be restarted to add them.
+	if (($(allocatable_hugepages_mib) < vm_mib)); then
+		[[ "${KUBERNETES:-}" == "vanilla" ]] \
+			|| skip "node $node has less than ${vm_mib} MiB of 2 MiB huge pages"
+		original_pages="$(host_cmd "cat /proc/sys/vm/nr_hugepages")"
+		original_allocatable="$(allocatable_hugepages)"
+		set_host_hugepages "$((original_pages + vm_mib / 2))" "$((original_pages * 2 + vm_mib))Mi" \
+			|| die "Failed to reserve ${vm_mib} MiB of huge pages on node $node"
+	fi
+	started=1
 
 	local hypervisor_name="${KATA_HYPERVISOR}"
 	local dropin_file="${BATS_TEST_TMPDIR}/99-k8s-hugepage-pod-sizing.toml"
@@ -179,7 +196,7 @@ POD
 
 teardown() {
 	hugepage_pod_sizing_supported || return 0
-	[[ -n "${original_pages:-}" ]] || return 0
+	[[ -n "${started:-}${original_pages:-}" ]] || return 0
 
 	kubectl describe pods || true
 	k8s_delete_all_pods_if_any_exists || true
@@ -188,8 +205,10 @@ teardown() {
 	remove_kata_runtime_config_dropin_file "$node" "${dropin_path:-}" \
 		|| echo "Warning: Failed to remove Kata runtime config drop-in on node $node"
 
-	set_host_hugepages "${original_pages}" "${original_allocatable}" \
-		|| echo "Warning: Failed to give back the huge pages on node $node"
+	if [[ -n "${original_pages:-}" ]]; then
+		set_host_hugepages "${original_pages}" "${original_allocatable}" \
+			|| echo "Warning: Failed to give back the huge pages on node $node"
+	fi
 
 	teardown_common "${node:-}" "${node_start_time:-}"
 }
