@@ -26,13 +26,10 @@ host_cmd() {
 	exec_host "$node" "nsenter --mount=/proc/1/ns/mnt $*"
 }
 
-allocatable_hugepages() {
-	kubectl get node "$node" -o jsonpath='{.status.allocatable.hugepages-2Mi}'
-}
-
+# The API server prints 2048Mi as 2Gi, so the quantity is compared in MiB.
 allocatable_hugepages_mib() {
 	local quantity
-	quantity="$(allocatable_hugepages)"
+	quantity="$(kubectl get node "$node" -o jsonpath='{.status.allocatable.hugepages-2Mi}')"
 	case "${quantity}" in
 		*Gi) echo "$((${quantity%Gi} * 1024))" ;;
 		*Mi) echo "${quantity%Mi}" ;;
@@ -75,12 +72,12 @@ POD
 
 set_host_hugepages() {
 	local pages="$1"
-	local expected="$2"
+	local expected_mib="$2"
 
 	host_cmd "sysctl -w vm.nr_hugepages=${pages}"
 	restart_kubelet || return 1
 
-	local cmd="[[ \"\$(kubectl get node $node -o jsonpath='{.status.allocatable.hugepages-2Mi}')\" == \"${expected}\" ]]"
+	local cmd="[[ \"\$(allocatable_hugepages_mib)\" == \"${expected_mib}\" ]]"
 	waitForProcess 120 5 "$cmd" || return 1
 	kubectl wait --for=condition=Ready --timeout=120s "node/${node}" || return 1
 }
@@ -99,8 +96,7 @@ setup() {
 		[[ "${KUBERNETES:-}" == "vanilla" ]] \
 			|| skip "node $node has less than ${vm_mib} MiB of 2 MiB huge pages"
 		original_pages="$(host_cmd "cat /proc/sys/vm/nr_hugepages")"
-		original_allocatable="$(allocatable_hugepages)"
-		set_host_hugepages "$((original_pages + vm_mib / 2))" "$((original_pages * 2 + vm_mib))Mi" \
+		set_host_hugepages "$((original_pages + vm_mib / 2))" "$((original_pages * 2 + vm_mib))" \
 			|| die "Failed to reserve ${vm_mib} MiB of huge pages on node $node"
 	fi
 	started=1
@@ -206,7 +202,7 @@ teardown() {
 		|| echo "Warning: Failed to remove Kata runtime config drop-in on node $node"
 
 	if [[ -n "${original_pages:-}" ]]; then
-		set_host_hugepages "${original_pages}" "${original_allocatable}" \
+		set_host_hugepages "${original_pages}" "$((original_pages * 2))" \
 			|| echo "Warning: Failed to give back the huge pages on node $node"
 	fi
 
