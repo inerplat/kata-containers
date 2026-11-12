@@ -101,6 +101,10 @@ jobs:
           sudo rm -rf /opt/google
           sudo rm -rf /usr/lib/firefox
 
+      # k8s-hugepage-pod-sizing.bats boots a 1536 MiB guest on 2 MiB huge pages.
+      - name: Reserve huge pages
+        run: sudo sysctl -w vm.nr_hugepages=768
+
       - name: Setup CRI-O
         run: bash tests/integration/kubernetes/gha-run.sh setup-crio
 
